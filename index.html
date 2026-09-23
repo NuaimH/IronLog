@@ -295,7 +295,8 @@
 
 <!-- ================= WORKOUT ================= -->
 <section class="view" id="view-workout">
-  <h2 style="font-size:20px; margin-bottom:14px;">Upper / Lower Split</h2>
+  <h2 style="font-size:20px; margin-bottom:2px;">Upper / Lower Split</h2>
+  <div style="font-size:12px; color:var(--text-muted); margin-bottom:14px;" id="progWeekLabel">Week 1</div>
 
   <div class="card" id="restCard" style="display:none;">
     <div class="card-title">Scheduled Rest Day</div>
@@ -423,6 +424,126 @@ const PLAN = {
 };
 const DAY_ORDER = ['upperA','lowerA','upperB','lowerB'];
 
+/* ============ PROGRESSIVE OVERLOAD ENGINE ============ */
+// Movement category decides the beginner starting weight and how fast it climbs.
+const EXERCISE_CATEGORY = {
+  'DB Bench Press':'push', 'DB Shoulder Press':'push', 'DB Incline Press':'push', 'Cable Chest Press':'push',
+  'Cable Row (pulley)':'pull', 'Cable Lat Pulldown':'pull', 'DB Single-Arm Row':'pull',
+  'DB Goblet Squat':'lowerCompound', 'DB Romanian Deadlift':'lowerCompound', 'DB Stiff-Leg Deadlift':'lowerCompound',
+  'DB Bulgarian Split Squat':'lowerCompound', 'DB Walking Lunge':'lowerCompound', 'Cable Hip Thrust':'lowerCompound', 'Cable Pull-Through':'lowerCompound',
+  'DB Lateral Raise':'isolation', 'DB Hammer Curl':'isolation', 'DB Rear Delt Fly':'isolation', 'DB Overhead Tricep Extension':'isolation',
+  'Cable Tricep Pushdown':'isolation', 'Cable Bicep Curl':'isolation', 'Cable Face Pull':'isolation',
+  'Cable Standing Calf Raise':'accessory', 'DB Seated Calf Raise':'accessory', 'Cable Woodchop':'accessory',
+  'Cable Pallof Press':'accessory', 'Cable Leg Press (if attach.)':'accessory'
+};
+// Beginner starting weight (kg) — a reasonable, conservative first-session estimate to self-adjust from.
+const CATEGORY_START = {
+  push:{male:10, female:5}, pull:{male:12, female:6}, lowerCompound:{male:14, female:8},
+  isolation:{male:6, female:3}, accessory:{male:10, female:6}
+};
+// Base weekly increment (kg) by category; cable stacks jump in coarser steps than dumbbells.
+const CATEGORY_INCREMENT = { push:2, pull:2, lowerCompound:2, isolation:1, accessory:1.5 };
+
+function exerciseMeta(name){
+  const category = EXERCISE_CATEGORY[name] || 'accessory';
+  const isCable = name.startsWith('Cable');
+  return { category, isCable };
+}
+function incrementFor(meta){ return meta.isCable ? CATEGORY_INCREMENT[meta.category] + 0.5 : CATEGORY_INCREMENT[meta.category]; }
+function findTarget(name){
+  for(const day of Object.values(PLAN)){ const f = day.exercises.find(e=>e.name===name); if(f) return f.target; }
+  return '3 x 10';
+}
+function parseRepMin(target){ const m = target.match(/x\s*(\d+)/); return m ? parseInt(m[1]) : 8; }
+function parseSetCount(target){ const m = target.match(/^(\d+)/); return m ? parseInt(m[1]) : 3; }
+function daysBetween(a,b){ return Math.round((new Date(b) - new Date(a)) / 86400000); }
+function addDaysISO(iso, n){ const d = new Date(iso); d.setDate(d.getDate()+n); return d.toISOString().slice(0,10); }
+
+function initProgressionIfNeeded(){
+  if(state.progression) return;
+  const sex = (state.profile && state.profile.sex) || 'male';
+  const weights = {};
+  Object.keys(EXERCISE_CATEGORY).forEach(name=>{
+    weights[name] = CATEGORY_START[exerciseMeta(name).category][sex];
+  });
+  state.progression = { weekWindowStart: todayISO(), currentWeek: 1, weights, log: [] };
+  persist();
+}
+
+// Re-seeds starting weights if the profile's sex is set/changed before any training has actually happened yet.
+function reseedProgressionIfUntouched(){
+  if(!state.progression || !state.profile) return;
+  if(state.progression.currentWeek !== 1 || state.completedSessions.length > 0) return;
+  const sex = state.profile.sex;
+  Object.keys(state.progression.weights).forEach(name=>{
+    state.progression.weights[name] = CATEGORY_START[exerciseMeta(name).category][sex];
+  });
+}
+
+function evaluateProgression(){
+  initProgressionIfNeeded();
+  const prog = state.progression;
+  let guard = 0;
+  while(daysBetween(prog.weekWindowStart, todayISO()) >= 7 && guard < 26){
+    guard++;
+    const windowStart = prog.weekWindowStart;
+    const windowEnd = addDaysISO(windowStart, 6);
+    const scheduledCount = state.schedule.filter(k=>k!=='rest').length || 1;
+    const completedInWindow = state.completedSessions.filter(s=>{
+      const date = s.split('|')[1];
+      return date >= windowStart && date <= windowEnd;
+    });
+    const completedCount = completedInWindow.length;
+
+    if(completedCount === 0){
+      // No training logged this window — hold everything, don't advance the week counter, just keep waiting.
+      prog.weekWindowStart = addDaysISO(windowStart, 7);
+      continue;
+    }
+
+    const completionRate = Math.min(1, completedCount / scheduledCount);
+
+    const setsByExercise = {};
+    completedInWindow.forEach(sessionKey=>{
+      const session = state.sessions[sessionKey];
+      if(!session) return;
+      Object.entries(session.exercises || {}).forEach(([name, sets])=>{
+        sets.forEach(s=>{
+          if(s.done && s.r !== ''){ (setsByExercise[name] = setsByExercise[name] || []).push(parseFloat(s.r)); }
+        });
+      });
+    });
+
+    Object.keys(prog.weights).forEach(name=>{
+      const meta = exerciseMeta(name);
+      const baseIncrement = incrementFor(meta);
+      const repMin = parseRepMin(findTarget(name));
+      const reps = setsByExercise[name];
+      const underperforming = reps && reps.length >= 2 && (reps.reduce((a,b)=>a+b,0)/reps.length) < repMin;
+
+      let delta = 0, note = 'hold';
+      if(underperforming){ delta = -baseIncrement; note = 'deload'; }
+      else if(completionRate >= 0.9){ delta = baseIncrement; note = 'increase'; }
+      else if(completionRate >= 0.5){ delta = Math.round(baseIncrement * completionRate * 2) / 2; note = 'partial'; }
+
+      prog.weights[name] = Math.max(1, Math.round((prog.weights[name] + delta) * 2) / 2);
+      prog.log.push({ week: prog.currentWeek, name, note, weight: prog.weights[name] });
+    });
+    if(prog.log.length > 150) prog.log = prog.log.slice(-150);
+
+    prog.currentWeek += 1;
+    prog.weekWindowStart = addDaysISO(windowStart, 7);
+  }
+  persist();
+}
+
+function lastProgressionNote(name){
+  for(let i = state.progression.log.length - 1; i >= 0; i--){
+    if(state.progression.log[i].name === name) return state.progression.log[i].note;
+  }
+  return null;
+}
+
 /* ============ WEEKLY SCHEDULE (customizable) ============ */
 // index 0=Sun,1=Mon,2=Tue,3=Wed,4=Thu,5=Fri,6=Sat — default: Upper/Lower, rest, Upper/Lower, weekend off
 if(!state.schedule) state.schedule = ['rest','upperA','lowerA','rest','upperB','lowerB','rest'];
@@ -481,6 +602,7 @@ function goTo(view){
   if(view==='workout') renderWorkout();
   if(view==='progress') renderProgress();
   if(view==='today') renderToday();
+  if(view==='setup') populateProfileForm();
 }
 
 /* ============ TOAST ============ */
@@ -549,6 +671,7 @@ function saveProfile(){
   if(!state.weightLog.length || state.weightLog[state.weightLog.length-1].w !== roundedKg){
     state.weightLog.push({ date: todayISO(), w: roundedKg });
   }
+  reseedProgressionIfUntouched();
   persist();
   toast('Profile saved');
   computeTargets();
@@ -604,16 +727,17 @@ function renderToday(){
   const d = new Date();
   document.getElementById('todayLabel').textContent = d.toLocaleDateString(undefined,{weekday:'short', month:'short', day:'numeric'});
   computeTargets();
+  evaluateProgression();
   const key = getScheduledKey(d);
   if(key === 'rest'){
     document.getElementById('todaySessionSummary').innerHTML =
       `<div style="font-size:16px; font-weight:700; margin-bottom:4px;">Rest Day</div>
-       <div style="font-size:13px; color:var(--text-muted);">Recovery day — no session scheduled</div>`;
+       <div style="font-size:13px; color:var(--text-muted);">Recovery day — no session scheduled · Program Week ${state.progression.currentWeek}</div>`;
   } else {
     const plan = PLAN[key];
     document.getElementById('todaySessionSummary').innerHTML =
       `<div style="font-size:16px; font-weight:700; margin-bottom:4px;">${plan.label}</div>
-       <div style="font-size:13px; color:var(--text-muted);">${plan.exercises.length} exercises · dumbbells + cable</div>`;
+       <div style="font-size:13px; color:var(--text-muted);">${plan.exercises.length} exercises · dumbbells + cable · Program Week ${state.progression.currentWeek}</div>`;
   }
   document.getElementById('quickWeight').placeholder = 'e.g. ' + (displayWeightUnit()==='lb' ? '172 lb' : '78.4 kg');
 }
@@ -634,6 +758,8 @@ function logQuickWeight(){
 let activeDayKey = null;
 
 function renderWorkout(){
+  evaluateProgression();
+  document.getElementById('progWeekLabel').textContent = 'Program Week ' + state.progression.currentWeek;
   const scheduledKey = getScheduledKey();
   document.getElementById('restCard').style.display = scheduledKey === 'rest' ? 'block' : 'none';
   if(!activeDayKey) activeDayKey = scheduledKey !== 'rest' ? scheduledKey : DAY_ORDER[0];
@@ -656,13 +782,19 @@ function renderWorkout(){
   const list = document.getElementById('exerciseList');
   list.innerHTML = '';
   PLAN[activeDayKey].exercises.forEach(ex=>{
-    if(!session.exercises[ex.name]) session.exercises[ex.name] = [{w:'', r:'', done:false},{w:'', r:'', done:false},{w:'', r:'', done:false}];
+    const suggested = state.progression.weights[ex.name];
+    if(!session.exercises[ex.name]){
+      const count = parseSetCount(ex.target);
+      session.exercises[ex.name] = Array.from({length: count}, ()=>({w: String(suggested), r:'', done:false}));
+    }
     const sets = session.exercises[ex.name];
 
     const wrap = document.createElement('div');
     wrap.className = 'exercise';
     const pr = getPR(ex.name);
-    wrap.innerHTML = `<div class="ex-name">${ex.name}</div><div class="ex-target">${ex.target}${pr ? ' · <span class="ex-pr">'+pr+'</span>' : ''}</div>`;
+    const isDeload = lastProgressionNote(ex.name) === 'deload';
+    const deloadTag = isDeload ? ' · <span style="color:var(--accent); font-weight:600;">Deload</span>' : '';
+    wrap.innerHTML = `<div class="ex-name">${ex.name}</div><div class="ex-target">${ex.target} · Suggested ${suggested}kg${deloadTag}${pr ? ' · <span class="ex-pr">'+pr+'</span>' : ''}</div>`;
 
     sets.forEach((s, i)=>{
       const row = document.createElement('div');
@@ -749,37 +881,41 @@ function renderProgress(){
 }
 
 /* ============ INIT ============ */
-function init(){
-  if(state.profile){
-    const p = state.profile;
-    document.getElementById('in_weight_unit').value = p.weightUnit || 'kg';
-    document.getElementById('in_weight').value = p.weightUnit === 'lb' ? Math.round(p.weightKg/0.453592*10)/10 : Math.round(p.weightKg*10)/10;
-
-    const hUnit = p.heightUnit || 'ft';
-    document.querySelectorAll('#seg_height_unit button').forEach(b=>b.classList.toggle('active', b.dataset.v===hUnit));
-    document.getElementById('heightFtWrap').style.display = hUnit==='ft' ? 'flex' : 'none';
-    document.getElementById('heightCmWrap').style.display = hUnit==='ft' ? 'none' : 'block';
-    if(hUnit === 'ft'){
-      const totalIn = p.heightCm / 2.54;
-      document.getElementById('in_height_ft').value = Math.floor(totalIn/12);
-      document.getElementById('in_height_in').value = Math.round(totalIn%12);
-    } else {
-      document.getElementById('in_height_cm').value = Math.round(p.heightCm);
-    }
-
-    document.getElementById('in_age').value = p.age;
-    document.getElementById('in_bodyfat').value = p.bodyFat || '';
-    const proteinField = document.getElementById('in_protein_per_kg');
-    proteinField.value = p.proteinPerKg || (p.goal==='cut'?2.2:2.0);
-    proteinField.dataset.userEdited = '1';
-    document.querySelectorAll('#seg_sex button').forEach(b=>b.classList.toggle('active', b.dataset.v===p.sex));
-    document.querySelectorAll('#seg_goal button').forEach(b=>b.classList.toggle('active', b.dataset.v===p.goal));
-    document.getElementById('in_activity').value = p.activity;
-    computeTargets();
-  } else {
+function populateProfileForm(){
+  if(!state.profile){
     document.getElementById('noProfileCard').style.display = 'block';
     updateProteinDefault();
+    return;
   }
+  const p = state.profile;
+  document.getElementById('in_weight_unit').value = p.weightUnit || 'kg';
+  document.getElementById('in_weight').value = p.weightUnit === 'lb' ? Math.round(p.weightKg/0.453592*10)/10 : Math.round(p.weightKg*10)/10;
+
+  const hUnit = p.heightUnit || 'ft';
+  document.querySelectorAll('#seg_height_unit button').forEach(b=>b.classList.toggle('active', b.dataset.v===hUnit));
+  document.getElementById('heightFtWrap').style.display = hUnit==='ft' ? 'flex' : 'none';
+  document.getElementById('heightCmWrap').style.display = hUnit==='ft' ? 'none' : 'block';
+  if(hUnit === 'ft'){
+    const totalIn = p.heightCm / 2.54;
+    document.getElementById('in_height_ft').value = Math.floor(totalIn/12);
+    document.getElementById('in_height_in').value = Math.round(totalIn%12);
+  } else {
+    document.getElementById('in_height_cm').value = Math.round(p.heightCm);
+  }
+
+  document.getElementById('in_age').value = p.age;
+  document.getElementById('in_bodyfat').value = p.bodyFat || '';
+  const proteinField = document.getElementById('in_protein_per_kg');
+  proteinField.value = p.proteinPerKg || (p.goal==='cut'?2.2:2.0);
+  proteinField.dataset.userEdited = '1';
+  document.querySelectorAll('#seg_sex button').forEach(b=>b.classList.toggle('active', b.dataset.v===p.sex));
+  document.querySelectorAll('#seg_goal button').forEach(b=>b.classList.toggle('active', b.dataset.v===p.goal));
+  document.getElementById('in_activity').value = p.activity;
+  computeTargets();
+}
+
+function init(){
+  populateProfileForm();
   renderToday();
 
   if('serviceWorker' in navigator){
